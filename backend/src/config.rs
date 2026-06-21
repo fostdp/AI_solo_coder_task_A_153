@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const DEFAULT_CONFIG_ENV: &str = "APP_CONFIG_PATH";
+const DEFAULT_CONFIG_PATH: &str = "config/app_config.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -112,6 +115,12 @@ pub struct AlertThresholdsConfig {
 }
 
 impl AppConfig {
+    pub fn default_path() -> PathBuf {
+        std::env::var(DEFAULT_CONFIG_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_CONFIG_PATH))
+    }
+
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let p = Path::new(path);
         let content = std::fs::read_to_string(p)?;
@@ -120,6 +129,7 @@ impl AppConfig {
     }
 
     pub fn load_default() -> anyhow::Result<Self> {
-        Self::load("config/app_config.json")
+        let p = Self::default_path();
+        Self::load(p.to_str().expect("config path should be valid utf-8"))
     }
 }

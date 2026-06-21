@@ -1,8 +1,9 @@
 use crate::config::RegressionModelConfig;
+use crate::metrics::Metrics;
 use rand::Rng;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Serialize, Clone, Debug)]
 pub struct YarnQualityResult {
@@ -82,7 +83,7 @@ impl OnlineCalibrator {
         &self.state
     }
 
-    pub fn add_sample(&mut self, sample: CalibrationSample) {
+    pub fn add_sample(&mut self, sample: CalibrationSample, metrics: Option<&Arc<Metrics>>) {
         if self.last_timestamp > 0.0 {
             let dt = (sample.timestamp_seconds - self.last_timestamp).max(0.0);
             self.state.total_runtime_seconds += dt;
@@ -99,7 +100,7 @@ impl OnlineCalibrator {
 
         self.state.sample_count += 1;
         self.update_wear_coefficient();
-        self.lms_update();
+        self.lms_update(metrics);
     }
 
     fn update_wear_coefficient(&mut self) {
@@ -109,7 +110,7 @@ impl OnlineCalibrator {
         self.state.wear_coefficient = (energy_term + time_term).min(self.cfg.wear_max_coefficient);
     }
 
-    fn lms_update(&mut self) {
+    fn lms_update(&mut self, metrics: Option<&Arc<Metrics>>) {
         if self.window.len() < 10 {
             return;
         }
@@ -144,6 +145,9 @@ impl OnlineCalibrator {
             self.state.alpha1 += lr * error_s * twist_factor;
             self.state.alpha2 += lr * error_s * sample.vibration_amplitude * wear_factor;
             self.state.alpha3 += lr * error_s * twist_factor * twist_factor;
+        }
+        if let Some(m) = metrics {
+            m.lms_updates_total.inc();
         }
 
         self.state.beta1 = self.state.beta1.clamp(-5.0, 0.0);
@@ -215,13 +219,15 @@ pub fn simulate_measured_values(
 pub struct QualityPredictor {
     cfg: RegressionModelConfig,
     calibrators: Mutex<HashMap<String, OnlineCalibrator>>,
+    metrics: Arc<Metrics>,
 }
 
 impl QualityPredictor {
-    pub fn new(cfg: RegressionModelConfig) -> Self {
+    pub fn new(cfg: RegressionModelConfig, metrics: Arc<Metrics>) -> Self {
         Self {
             cfg,
             calibrators: Mutex::new(HashMap::new()),
+            metrics,
         }
     }
 
@@ -260,7 +266,7 @@ impl QualityPredictor {
             measured_strength,
             timestamp_seconds,
         };
-        calibrator.add_sample(sample);
+        calibrator.add_sample(sample, Some(&self.metrics));
 
         let state = calibrator.state().clone();
         let (predicted_uniformity, predicted_strength, twist_variance, wear_coefficient) =
@@ -268,6 +274,8 @@ impl QualityPredictor {
 
         let lambda = self.cfg.vibration_impact_lambda;
         let vibration_impact_factor = 1.0 - (-lambda * vibration_amplitude).exp();
+
+        self.metrics.quality_predictions_total.inc();
 
         YarnQualityResult {
             predicted_uniformity: predicted_uniformity.max(0.0),

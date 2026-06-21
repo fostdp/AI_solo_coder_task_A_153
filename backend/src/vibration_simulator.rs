@@ -1,6 +1,8 @@
 use crate::config::{OilFilmBearingConfig, RotorDynamicsConfig};
+use crate::metrics::Metrics;
 use serde::Serialize;
 use std::f64::consts::PI;
+use std::sync::Arc;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct VibrationResult {
@@ -230,9 +232,15 @@ pub async fn run_vibration_service(
     sim: VibrationSimulator,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<(String, f64)>,
     tx: tokio::sync::mpsc::UnboundedSender<(String, VibrationResult)>,
+    metrics: Arc<Metrics>,
 ) {
     while let Some((spindle_id, rpm)) = rx.recv().await {
         let result = sim.analyze(rpm);
+        metrics.vibration_analyses_total.inc();
+        if result.whirl_instability {
+            metrics.whirl_instability_events_total.inc();
+        }
+        tracing::debug!(%spindle_id, rpm, total_displacement = %result.total_displacement, "vibration analyzed");
         if let Err(e) = tx.send((spindle_id, result)) {
             tracing::error!("Vibration service send error: {}", e);
         }

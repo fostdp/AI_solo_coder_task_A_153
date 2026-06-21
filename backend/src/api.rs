@@ -1,24 +1,30 @@
 use crate::alarm_mqtt::{self, AlertRecord};
 use crate::ch_writer::ClickHouseWriter;
 use crate::config::AppConfig;
+use crate::metrics::Metrics;
 use crate::quality_predictor::QualityPredictor;
 use crate::vibration_simulator::VibrationSimulator;
 use axum::{
+    body::Body,
     extract::State,
-    http::StatusCode,
-    response::Json,
+    http::{Request, StatusCode, Uri},
+    response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Instant;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
 
 pub struct AppState {
     pub ch_writer: Arc<ClickHouseWriter>,
     pub quality_predictor: Arc<QualityPredictor>,
     pub vibration_simulator: VibrationSimulator,
     pub config: Arc<AppConfig>,
+    pub metrics: Arc<Metrics>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -38,7 +44,10 @@ pub struct SimulationResponse {
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
+    let metrics_clone = Arc::clone(&state.metrics);
+
     Router::new()
+        .route("/metrics", get(metrics_handler))
         .route("/api/sensor-data", get(get_sensor_data))
         .route("/api/vibration-analysis", get(get_vibration_analysis))
         .route("/api/yarn-quality", get(get_yarn_quality))
@@ -46,7 +55,68 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/simulate", post(run_simulation))
         .route("/api/spindle-list", get(get_spindle_list))
         .route("/api/latest/:spindle_id", get(get_latest))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
+        .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(move |req: Request<Body>, next: axum::middleware::Next<Body>| {
+            let m = Arc::clone(&metrics_clone);
+            async move {
+                let start = Instant::now();
+                let method = req.method().clone();
+                let endpoint = route_label(req.uri());
+                let resp = next.run(req).await;
+                let status = resp.status().as_str().to_string();
+                let dur = start.elapsed().as_secs_f64();
+                m.api_request_duration_seconds
+                    .with_label_values(&[&endpoint, method.as_str(), &status])
+                    .observe(dur);
+                resp
+            }
+        }))
         .with_state(state)
+}
+
+fn route_label(uri: &Uri) -> String {
+    let p = uri.path();
+    if p.starts_with("/api/sensor-data") {
+        "/api/sensor-data".into()
+    } else if p.starts_with("/api/vibration-analysis") {
+        "/api/vibration-analysis".into()
+    } else if p.starts_with("/api/yarn-quality") {
+        "/api/yarn-quality".into()
+    } else if p.starts_with("/api/alerts") {
+        "/api/alerts".into()
+    } else if p.starts_with("/api/simulate") {
+        "/api/simulate".into()
+    } else if p.starts_with("/api/spindle-list") {
+        "/api/spindle-list".into()
+    } else if p.starts_with("/api/latest") {
+        "/api/latest/:spindle_id".into()
+    } else if p == "/metrics" {
+        "/metrics".into()
+    } else {
+        p.into()
+    }
+}
+
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.metrics.encode_text() {
+        Ok(txt) => (
+            StatusCode::OK,
+            [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+            txt,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("metrics encode error: {}", e),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_sensor_data(

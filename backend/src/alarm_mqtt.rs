@@ -1,10 +1,12 @@
 use chrono::Utc;
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use serde::Serialize;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::config::{AlertThresholdsConfig, MqttConfig};
+use crate::metrics::Metrics;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct AlertRecord {
@@ -160,6 +162,7 @@ pub fn alert_to_mqtt_payload(alert: &AlertRecord) -> String {
 pub async fn run_alert_mqtt_service(
     mqtt_cfg: MqttConfig,
     mut rx: mpsc::UnboundedReceiver<AlertRecord>,
+    _metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
     let mut options = MqttOptions::new(
         &mqtt_cfg.alert_publisher_client_id,

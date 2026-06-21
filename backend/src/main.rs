@@ -2,6 +2,7 @@ mod alarm_mqtt;
 mod api;
 mod ch_writer;
 mod config;
+mod metrics;
 mod mqtt_receiver;
 mod quality_predictor;
 mod vibration_simulator;
@@ -9,6 +10,7 @@ mod vibration_simulator;
 use alarm_mqtt::AlertRecord;
 use ch_writer::{ClickHouseWriter, WriteCommand};
 use config::AppConfig;
+use metrics::Metrics;
 use mqtt_receiver::ValidatedSensorData;
 use quality_predictor::QualityPredictor;
 use vibration_simulator::VibrationSimulator;
@@ -16,22 +18,57 @@ use vibration_simulator::VibrationSimulator;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing_subscriber::{fmt, EnvFilter};
+
+fn init_tracing() {
+    let is_json = std::env::var("LOG_FORMAT")
+        .map(|s| s.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let builder = fmt().with_env_filter(filter).with_target(true);
+
+    if is_json {
+        builder
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_line_number(true)
+            .init();
+    } else {
+        builder
+            .with_ansi(true)
+            .with_level(true)
+            .with_thread_ids(false)
+            .init();
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing();
 
     let cfg = Arc::new(AppConfig::load_default()?);
-    tracing::info!("Configuration loaded");
+    tracing::info!(
+        config_path = AppConfig::default_path().to_str(),
+        "Configuration loaded"
+    );
 
-    let ch_writer = Arc::new(ClickHouseWriter::new(&cfg.clickhouse.base_url));
+    let metrics = Metrics::new()?;
+    tracing::info!("Prometheus metrics registry initialized");
+
+    let ch_writer = Arc::new(ClickHouseWriter::new(&cfg.clickhouse.base_url, Arc::clone(&metrics)));
 
     let vibration_sim = VibrationSimulator::new(
         cfg.rotor_dynamics.clone(),
         cfg.oil_film_bearing.clone(),
     );
 
-    let quality_predictor = Arc::new(QualityPredictor::new(cfg.regression_model.clone()));
+    let quality_predictor = Arc::new(QualityPredictor::new(
+        cfg.regression_model.clone(),
+        Arc::clone(&metrics),
+    ));
 
     let (write_tx, write_rx) = mpsc::unbounded_channel::<WriteCommand>();
     let (vib_tx, vib_rx) = mpsc::unbounded_channel::<(String, f64)>();
@@ -50,17 +87,19 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg_clone = Arc::clone(&cfg);
     let sensor_tx_clone = sensor_tx.clone();
+    let metrics_mqtt = Arc::clone(&metrics);
     tokio::spawn(async move {
         if let Err(e) =
-            mqtt_receiver::run_receiver_service((*cfg_clone).clone(), sensor_tx_clone).await
+            mqtt_receiver::run_receiver_service((*cfg_clone).clone(), sensor_tx_clone, metrics_mqtt).await
         {
             tracing::error!("MQTT receiver service error: {}", e);
         }
     });
 
     let sim_clone = vibration_sim.clone();
+    let metrics_vib = Arc::clone(&metrics);
     tokio::spawn(async move {
-        vibration_simulator::run_vibration_service(sim_clone, vib_rx, vib_out_tx).await;
+        vibration_simulator::run_vibration_service(sim_clone, vib_rx, vib_out_tx, metrics_vib).await;
     });
 
     let predictor_clone = Arc::clone(&quality_predictor);
@@ -69,8 +108,9 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let mqtt_cfg = cfg.mqtt.clone();
+    let metrics_alert = Arc::clone(&metrics);
     tokio::spawn(async move {
-        if let Err(e) = alarm_mqtt::run_alert_mqtt_service(mqtt_cfg, alert_rx).await {
+        if let Err(e) = alarm_mqtt::run_alert_mqtt_service(mqtt_cfg, alert_rx, metrics_alert).await {
             tracing::error!("Alert MQTT service error: {}", e);
         }
     });
@@ -80,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
     let qual_tx_dispatch = qual_tx.clone();
     let alert_tx_dispatch = alert_tx.clone();
     let cfg_dispatch = Arc::clone(&cfg);
+    let metrics_dispatch = Arc::clone(&metrics);
     tokio::spawn(async move {
         dispatch_loop(
             sensor_rx,
@@ -90,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
             qual_tx_dispatch,
             alert_tx_dispatch,
             cfg_dispatch,
+            metrics_dispatch,
         )
         .await;
     });
@@ -99,11 +141,12 @@ async fn main() -> anyhow::Result<()> {
         quality_predictor: Arc::clone(&quality_predictor),
         vibration_simulator: vibration_sim.clone(),
         config: Arc::clone(&cfg),
+        metrics: Arc::clone(&metrics),
     });
     let app = api::create_router(Arc::clone(&app_state));
     let addr_str = format!("{}:{}", cfg.api.bind_address, cfg.api.bind_port);
     let addr: SocketAddr = addr_str.parse()?;
-    tracing::info!("Server listening on {}", addr);
+    tracing::info!(%addr, "Server listening");
     let server = axum::Server::bind(&addr).serve(app.into_make_service());
     server.await?;
 
@@ -125,6 +168,7 @@ async fn dispatch_loop(
     qual_tx: mpsc::UnboundedSender<(String, f64, f64, f64)>,
     alert_tx: mpsc::UnboundedSender<AlertRecord>,
     cfg: Arc<AppConfig>,
+    metrics: Arc<Metrics>,
 ) {
     use std::collections::HashMap;
 
@@ -136,6 +180,10 @@ async fn dispatch_loop(
                 let spindle_id = valid.data.spindle_id.clone();
                 let timestamp = valid.received_at.to_rfc3339();
                 let sid = spindle_id.clone();
+
+                metrics.sensor_samples_total
+                    .with_label_values(&[&spindle_id])
+                    .inc();
 
                 let _ = write_tx.send(WriteCommand::SensorData {
                     timestamp: timestamp.clone(),
@@ -169,6 +217,10 @@ async fn dispatch_loop(
                 let entry = pending.entry(sid.clone()).or_insert_with(PendingState::new);
                 entry.vibration = Some(vib_result.clone());
 
+                if vib_result.whirl_instability {
+                    metrics.whirl_instability_events_total.inc();
+                }
+
                 let ts = entry.timestamp.clone();
                 let _ = write_tx.send(WriteCommand::VibrationAnalysis {
                     timestamp: ts,
@@ -190,6 +242,11 @@ async fn dispatch_loop(
                         cfg.regression_model.target_twist_per_meter,
                     );
                     for a in alerts {
+                        let atype = a.alert_type.clone();
+                        let sev = a.severity.clone();
+                        metrics.alerts_total
+                            .with_label_values(&[&atype, &sev])
+                            .inc();
                         let _ = write_tx.send(WriteCommand::Alert { alert: a.clone() });
                         let _ = alert_tx.send(a);
                     }
@@ -199,6 +256,7 @@ async fn dispatch_loop(
             Some((sid, qual_result)) = qual_out_rx.recv() => {
                 let entry = pending.entry(sid.clone()).or_insert_with(PendingState::new);
                 let ts = entry.timestamp.clone();
+                metrics.wear_coefficient.set((qual_result.wear_coefficient * 1000.0).round() as i64);
                 let _ = write_tx.send(WriteCommand::YarnQuality {
                     timestamp: ts,
                     spindle_id: sid,

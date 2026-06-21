@@ -1,4 +1,5 @@
 use crate::alarm_mqtt::AlertRecord;
+use crate::metrics::Metrics;
 use crate::quality_predictor::YarnQualityResult;
 use crate::vibration_simulator::VibrationResult;
 use reqwest::Client;
@@ -8,13 +9,15 @@ use tokio::sync::mpsc;
 pub struct ClickHouseWriter {
     client: Client,
     base_url: String,
+    metrics: Arc<Metrics>,
 }
 
 impl ClickHouseWriter {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, metrics: Arc<Metrics>) -> Self {
         Self {
             client: Client::new(),
             base_url: base_url.to_string(),
+            metrics,
         }
     }
 
@@ -142,7 +145,7 @@ pub async fn writer_loop(
                 temperature,
                 twist_per_meter,
             } => {
-                if let Err(e) = writer
+                let r = writer
                     .insert_sensor_data(
                         &timestamp,
                         &spindle_id,
@@ -151,8 +154,14 @@ pub async fn writer_loop(
                         temperature,
                         twist_per_meter,
                     )
-                    .await
-                {
+                    .await;
+                let status = if r.is_ok() { "ok" } else { "err" };
+                writer
+                    .metrics
+                    .clickhouse_write_total
+                    .with_label_values(&["spindle_sensor_data", status])
+                    .inc();
+                if let Err(e) = r {
                     tracing::error!("Failed to write sensor data: {}", e);
                 }
             }
@@ -161,10 +170,16 @@ pub async fn writer_loop(
                 spindle_id,
                 result,
             } => {
-                if let Err(e) = writer
+                let r = writer
                     .insert_vibration_analysis(&timestamp, &spindle_id, &result)
-                    .await
-                {
+                    .await;
+                let status = if r.is_ok() { "ok" } else { "err" };
+                writer
+                    .metrics
+                    .clickhouse_write_total
+                    .with_label_values(&["vibration_analysis", status])
+                    .inc();
+                if let Err(e) = r {
                     tracing::error!("Failed to write vibration analysis: {}", e);
                 }
             }
@@ -173,15 +188,28 @@ pub async fn writer_loop(
                 spindle_id,
                 result,
             } => {
-                if let Err(e) = writer
+                let r = writer
                     .insert_yarn_quality(&timestamp, &spindle_id, &result)
-                    .await
-                {
+                    .await;
+                let status = if r.is_ok() { "ok" } else { "err" };
+                writer
+                    .metrics
+                    .clickhouse_write_total
+                    .with_label_values(&["yarn_quality", status])
+                    .inc();
+                if let Err(e) = r {
                     tracing::error!("Failed to write yarn quality: {}", e);
                 }
             }
             WriteCommand::Alert { alert } => {
-                if let Err(e) = writer.insert_alert(&alert).await {
+                let r = writer.insert_alert(&alert).await;
+                let status = if r.is_ok() { "ok" } else { "err" };
+                writer
+                    .metrics
+                    .clickhouse_write_total
+                    .with_label_values(&["alerts", status])
+                    .inc();
+                if let Err(e) = r {
                     tracing::error!("Failed to write alert: {}", e);
                 }
             }

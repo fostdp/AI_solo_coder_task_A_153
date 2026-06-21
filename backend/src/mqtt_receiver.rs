@@ -1,6 +1,8 @@
 use crate::config::ValidationConfig;
+use crate::metrics::Metrics;
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -100,6 +102,7 @@ pub async fn start_mqtt_receiver<F>(
     topic: &str,
     keep_alive_sec: u64,
     validation_cfg: ValidationConfig,
+    metrics: Arc<Metrics>,
     mut on_valid: F,
 ) -> anyhow::Result<()>
 where
@@ -116,14 +119,30 @@ where
             Ok(notification) => {
                 if let rumqttc::Event::Incoming(rumqttc::Incoming::Publish(publish)) = notification
                 {
+                    metrics.mqtt_messages_total.inc();
                     match serde_json::from_slice::<SensorData>(&publish.payload) {
                         Ok(raw) => match validate_sensor_data(raw, &validation_cfg) {
                             Ok(valid) => on_valid(valid),
                             Err(e) => {
+                                let label = match &e {
+                                    ValidationError::RpmOutOfRange { .. } => "rpm_out_of_range",
+                                    ValidationError::VibrationOutOfRange { .. } => "vibration_out_of_range",
+                                    ValidationError::TemperatureOutOfRange { .. } => "temperature_out_of_range",
+                                    ValidationError::TwistOutOfRange { .. } => "twist_out_of_range",
+                                    ValidationError::EmptySpindleId => "empty_spindle_id",
+                                };
+                                metrics
+                                    .mqtt_messages_invalid_total
+                                    .with_label_values(&[label])
+                                    .inc();
                                 tracing::warn!("Sensor data validation failed: {}", e);
                             }
                         },
                         Err(e) => {
+                            metrics
+                                .mqtt_messages_invalid_total
+                                .with_label_values(&["deserialize_error"])
+                                .inc();
                             tracing::warn!("Failed to deserialize sensor data: {}", e);
                         }
                     }
@@ -140,6 +159,7 @@ where
 pub async fn run_receiver_service(
     cfg: crate::config::AppConfig,
     tx: mpsc::UnboundedSender<ValidatedSensorData>,
+    metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
     let mqtt_cfg = cfg.mqtt.clone();
     let val_cfg = cfg.validation.clone();
@@ -150,6 +170,7 @@ pub async fn run_receiver_service(
         &mqtt_cfg.sensor_topic,
         mqtt_cfg.keep_alive_seconds,
         val_cfg,
+        metrics,
         move |valid| {
             if let Err(e) = tx.send(valid) {
                 tracing::error!("Failed to send validated data to channel: {}", e);
