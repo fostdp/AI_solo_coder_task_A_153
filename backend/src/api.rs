@@ -1,5 +1,8 @@
+use crate::alarm_mqtt::{self, AlertRecord};
 use crate::ch_writer::ClickHouseWriter;
-use crate::yarn_predict::YarnPredictor;
+use crate::config::AppConfig;
+use crate::quality_predictor::QualityPredictor;
+use crate::vibration_simulator::VibrationSimulator;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -13,7 +16,9 @@ use std::sync::Arc;
 
 pub struct AppState {
     pub ch_writer: Arc<ClickHouseWriter>,
-    pub yarn_predictor: Arc<YarnPredictor>,
+    pub quality_predictor: Arc<QualityPredictor>,
+    pub vibration_simulator: VibrationSimulator,
+    pub config: Arc<AppConfig>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -27,9 +32,9 @@ pub struct SimulationRequest {
 
 #[derive(Serialize)]
 pub struct SimulationResponse {
-    pub vibration: crate::vibration::VibrationResult,
-    pub yarn_quality: crate::yarn_predict::YarnQualityResult,
-    pub alerts: Vec<crate::alert::AlertRecord>,
+    pub vibration: crate::vibration_simulator::VibrationResult,
+    pub yarn_quality: crate::quality_predictor::YarnQualityResult,
+    pub alerts: Vec<AlertRecord>,
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
@@ -156,9 +161,14 @@ async fn run_simulation(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SimulationRequest>,
 ) -> Json<SimulationResponse> {
-    let vibration = crate::vibration::analyze_vibration(req.rpm, req.vibration_amplitude);
-    let yarn_quality = state.yarn_predictor.predict(&req.spindle_id, req.vibration_amplitude, req.twist_per_meter, chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
-    let alerts = crate::alert::check_alerts(
+    let vibration = state.vibration_simulator.analyze(req.rpm);
+    let yarn_quality = state.quality_predictor.predict(
+        &req.spindle_id,
+        req.vibration_amplitude,
+        req.twist_per_meter,
+        chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+    );
+    let alerts = alarm_mqtt::check_alerts(
         &req.spindle_id,
         req.rpm,
         req.vibration_amplitude,
@@ -167,6 +177,8 @@ async fn run_simulation(
         vibration.critical_rpm,
         vibration.whirl_instability,
         vibration.whirl_ratio,
+        &state.config.alert_thresholds,
+        state.config.regression_model.target_twist_per_meter,
     );
     Json(SimulationResponse {
         vibration,

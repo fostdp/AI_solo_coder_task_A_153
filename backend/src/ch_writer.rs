@@ -1,6 +1,6 @@
-use crate::alert::AlertRecord;
-use crate::vibration::VibrationResult;
-use crate::yarn_predict::YarnQualityResult;
+use crate::alarm_mqtt::AlertRecord;
+use crate::quality_predictor::YarnQualityResult;
+use crate::vibration_simulator::VibrationResult;
 use reqwest::Client;
 use std::sync::Arc;
 use tokio::sync::mpsc;
