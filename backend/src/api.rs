@@ -1,4 +1,5 @@
 use crate::ch_writer::ClickHouseWriter;
+use crate::yarn_predict::YarnPredictor;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -9,6 +10,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+pub struct AppState {
+    pub ch_writer: Arc<ClickHouseWriter>,
+    pub yarn_predictor: Arc<YarnPredictor>,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct SimulationRequest {
@@ -26,7 +32,7 @@ pub struct SimulationResponse {
     pub alerts: Vec<crate::alert::AlertRecord>,
 }
 
-pub fn create_router(ch_writer: Arc<ClickHouseWriter>) -> Router {
+pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/sensor-data", get(get_sensor_data))
         .route("/api/vibration-analysis", get(get_vibration_analysis))
@@ -35,11 +41,11 @@ pub fn create_router(ch_writer: Arc<ClickHouseWriter>) -> Router {
         .route("/api/simulate", post(run_simulation))
         .route("/api/spindle-list", get(get_spindle_list))
         .route("/api/latest/:spindle_id", get(get_latest))
-        .with_state(ch_writer)
+        .with_state(state)
 }
 
 async fn get_sensor_data(
-    State(writer): State<Arc<ClickHouseWriter>>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, StatusCode> {
     let limit = params.get("limit").map(|s| s.as_str()).unwrap_or("100");
@@ -55,7 +61,7 @@ async fn get_sensor_data(
             spindle_id, limit
         )
     };
-    match writer.query(&sql).await {
+    match state.ch_writer.query(&sql).await {
         Ok(body) => {
             let parsed: Value = serde_json::from_str(&body).unwrap_or(json!({"data": body}));
             Ok(Json(parsed))
@@ -68,7 +74,7 @@ async fn get_sensor_data(
 }
 
 async fn get_vibration_analysis(
-    State(writer): State<Arc<ClickHouseWriter>>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, StatusCode> {
     let limit = params.get("limit").map(|s| s.as_str()).unwrap_or("100");
@@ -84,7 +90,7 @@ async fn get_vibration_analysis(
             spindle_id, limit
         )
     };
-    match writer.query(&sql).await {
+    match state.ch_writer.query(&sql).await {
         Ok(body) => {
             let parsed: Value = serde_json::from_str(&body).unwrap_or(json!({"data": body}));
             Ok(Json(parsed))
@@ -97,7 +103,7 @@ async fn get_vibration_analysis(
 }
 
 async fn get_yarn_quality(
-    State(writer): State<Arc<ClickHouseWriter>>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, StatusCode> {
     let limit = params.get("limit").map(|s| s.as_str()).unwrap_or("100");
@@ -113,7 +119,7 @@ async fn get_yarn_quality(
             spindle_id, limit
         )
     };
-    match writer.query(&sql).await {
+    match state.ch_writer.query(&sql).await {
         Ok(body) => {
             let parsed: Value = serde_json::from_str(&body).unwrap_or(json!({"data": body}));
             Ok(Json(parsed))
@@ -126,7 +132,7 @@ async fn get_yarn_quality(
 }
 
 async fn get_alerts(
-    State(writer): State<Arc<ClickHouseWriter>>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, StatusCode> {
     let limit = params.get("limit").map(|s| s.as_str()).unwrap_or("100");
@@ -134,7 +140,7 @@ async fn get_alerts(
         "SELECT * FROM spindle_system.alerts ORDER BY timestamp DESC LIMIT {} FORMAT JSON",
         limit
     );
-    match writer.query(&sql).await {
+    match state.ch_writer.query(&sql).await {
         Ok(body) => {
             let parsed: Value = serde_json::from_str(&body).unwrap_or(json!({"data": body}));
             Ok(Json(parsed))
@@ -147,11 +153,11 @@ async fn get_alerts(
 }
 
 async fn run_simulation(
-    State(_writer): State<Arc<ClickHouseWriter>>,
+    State(state): State<Arc<AppState>>,
     Json(req): Json<SimulationRequest>,
 ) -> Json<SimulationResponse> {
     let vibration = crate::vibration::analyze_vibration(req.rpm, req.vibration_amplitude);
-    let yarn_quality = crate::yarn_predict::predict_yarn_quality(req.vibration_amplitude, req.twist_per_meter);
+    let yarn_quality = state.yarn_predictor.predict(&req.spindle_id, req.vibration_amplitude, req.twist_per_meter, chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
     let alerts = crate::alert::check_alerts(
         &req.spindle_id,
         req.rpm,
@@ -159,6 +165,8 @@ async fn run_simulation(
         req.temperature,
         req.twist_per_meter,
         vibration.critical_rpm,
+        vibration.whirl_instability,
+        vibration.whirl_ratio,
     );
     Json(SimulationResponse {
         vibration,
@@ -168,10 +176,10 @@ async fn run_simulation(
 }
 
 async fn get_spindle_list(
-    State(writer): State<Arc<ClickHouseWriter>>,
+    State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, StatusCode> {
     let sql = "SELECT DISTINCT spindle_id FROM spindle_system.spindle_sensor_data ORDER BY spindle_id FORMAT JSON".to_string();
-    match writer.query(&sql).await {
+    match state.ch_writer.query(&sql).await {
         Ok(body) => {
             let parsed: Value = serde_json::from_str(&body).unwrap_or(json!({"data": body}));
             Ok(Json(parsed))
@@ -184,14 +192,14 @@ async fn get_spindle_list(
 }
 
 async fn get_latest(
-    State(writer): State<Arc<ClickHouseWriter>>,
+    State(state): State<Arc<AppState>>,
     axum::extract::Path(spindle_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let sql = format!(
         "SELECT s.*, v.*, y.* FROM spindle_system.spindle_sensor_data s LEFT JOIN spindle_system.vibration_analysis v ON s.spindle_id = v.spindle_id AND s.timestamp = v.timestamp LEFT JOIN spindle_system.yarn_quality y ON s.spindle_id = y.spindle_id AND s.timestamp = y.timestamp WHERE s.spindle_id = '{}' ORDER BY s.timestamp DESC LIMIT 1 FORMAT JSON",
         spindle_id
     );
-    match writer.query(&sql).await {
+    match state.ch_writer.query(&sql).await {
         Ok(body) => {
             let parsed: Value = serde_json::from_str(&body).unwrap_or(json!({"data": body}));
             Ok(Json(parsed))

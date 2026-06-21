@@ -30,7 +30,12 @@ CREATE TABLE IF NOT EXISTS vibration_analysis
     vibration_x Float64,
     vibration_y Float64,
     total_displacement Float64,
-    phase_angle Float64
+    phase_angle Float64,
+    nonlinear_force_x Float64,
+    nonlinear_force_y Float64,
+    whirl_instability UInt8,
+    nonlinear_damping_factor Float64,
+    oil_film_pressure_peak Float64
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(timestamp)
@@ -43,7 +48,14 @@ CREATE TABLE IF NOT EXISTS yarn_quality
     predicted_uniformity Float64,
     predicted_strength Float64,
     twist_variance Float64,
-    vibration_impact_factor Float64
+    vibration_impact_factor Float64,
+    wear_coefficient Float64,
+    calibration_error Float64,
+    sample_count Int64,
+    beta0 Float64,
+    beta1 Float64,
+    alpha0 Float64,
+    alpha1 Float64
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(timestamp)
@@ -53,7 +65,7 @@ CREATE TABLE IF NOT EXISTS alerts
 (
     timestamp DateTime64(3),
     spindle_id String,
-    alert_type Enum8('vibration_overload' = 1, 'twist_uneven' = 2, 'critical_speed' = 3, 'temperature_high' = 4),
+    alert_type Enum8('vibration_overload' = 1, 'twist_uneven' = 2, 'critical_speed' = 3, 'temperature_high' = 4, 'oil_whirl' = 5),
     severity Enum8('warning' = 1, 'critical' = 2),
     message String,
     value Float64,

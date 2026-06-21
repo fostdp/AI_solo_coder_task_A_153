@@ -41,7 +41,7 @@ impl ClickHouseWriter {
         result: &VibrationResult,
     ) -> anyhow::Result<()> {
         let query = format!(
-            "INSERT INTO spindle_system.vibration_analysis (timestamp, spindle_id, critical_rpm, unbalance_response, oil_film_stiffness_x, oil_film_stiffness_y, oil_film_damping_x, oil_film_damping_y, whirl_ratio, eccentricity_ratio, vibration_x, vibration_y, total_displacement, phase_angle) VALUES ('{}', '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO spindle_system.vibration_analysis (timestamp, spindle_id, critical_rpm, unbalance_response, oil_film_stiffness_x, oil_film_stiffness_y, oil_film_damping_x, oil_film_damping_y, whirl_ratio, eccentricity_ratio, vibration_x, vibration_y, total_displacement, phase_angle, nonlinear_force_x, nonlinear_force_y, whirl_instability, nonlinear_damping_factor, oil_film_pressure_peak) VALUES ('{}', '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             timestamp,
             spindle_id,
             result.critical_rpm,
@@ -55,7 +55,12 @@ impl ClickHouseWriter {
             result.vibration_x,
             result.vibration_y,
             result.total_displacement,
-            result.phase_angle
+            result.phase_angle,
+            result.nonlinear_force_x,
+            result.nonlinear_force_y,
+            if result.whirl_instability { 1 } else { 0 },
+            result.nonlinear_damping_factor,
+            result.oil_film_pressure_peak
         );
         self.execute(&query).await
     }
@@ -67,13 +72,20 @@ impl ClickHouseWriter {
         result: &YarnQualityResult,
     ) -> anyhow::Result<()> {
         let query = format!(
-            "INSERT INTO spindle_system.yarn_quality (timestamp, spindle_id, predicted_uniformity, predicted_strength, twist_variance, vibration_impact_factor) VALUES ('{}', '{}', {}, {}, {}, {})",
+            "INSERT INTO spindle_system.yarn_quality (timestamp, spindle_id, predicted_uniformity, predicted_strength, twist_variance, vibration_impact_factor, wear_coefficient, calibration_error, sample_count, beta0, beta1, alpha0, alpha1) VALUES ('{}', '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             timestamp,
             spindle_id,
             result.predicted_uniformity,
             result.predicted_strength,
             result.twist_variance,
-            result.vibration_impact_factor
+            result.vibration_impact_factor,
+            result.wear_coefficient,
+            result.calibration_error,
+            result.sample_count as i64,
+            result.beta0,
+            result.beta1,
+            result.alpha0,
+            result.alpha1
         );
         self.execute(&query).await
     }

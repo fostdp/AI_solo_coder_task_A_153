@@ -4,8 +4,10 @@ mod ch_writer;
 mod mqtt_sub;
 mod vibration;
 mod yarn_predict;
+mod calibration;
 
 use ch_writer::{ClickHouseWriter, WriteCommand};
+use yarn_predict::YarnPredictor;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -14,6 +16,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let ch_writer = Arc::new(ClickHouseWriter::new("http://localhost:8123"));
+    let yarn_predictor = Arc::new(YarnPredictor::new());
     let (write_tx, write_rx) = mpsc::unbounded_channel::<WriteCommand>();
     let (alert_tx, alert_rx) = mpsc::unbounded_channel::<alert::AlertRecord>();
 
@@ -29,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
 
     let alert_tx_clone = alert_tx.clone();
     let write_tx_clone = write_tx.clone();
+    let yarn_predictor_clone = Arc::clone(&yarn_predictor);
 
     let on_message = move |data: mqtt_sub::SensorData| {
         let timestamp = chrono::Utc::now().to_rfc3339();
@@ -52,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
         });
 
         let yarn_result =
-            yarn_predict::predict_yarn_quality(data.vibration_amplitude, data.twist_per_meter);
+            yarn_predictor_clone.predict(&spindle_id, data.vibration_amplitude, data.twist_per_meter, chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
 
         let _ = write_tx_clone.send(WriteCommand::YarnQuality {
             timestamp: timestamp.clone(),
@@ -67,6 +71,8 @@ async fn main() -> anyhow::Result<()> {
             data.temperature,
             data.twist_per_meter,
             vib_result.critical_rpm,
+            vib_result.whirl_instability,
+            vib_result.whirl_ratio,
         );
 
         for a in alerts {
@@ -84,7 +90,11 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let app = api::create_router(Arc::clone(&ch_writer));
+    let app_state = Arc::new(api::AppState {
+        ch_writer: Arc::clone(&ch_writer),
+        yarn_predictor: Arc::clone(&yarn_predictor),
+    });
+    let app = api::create_router(Arc::clone(&app_state));
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 3000));
     tracing::info!("Server listening on {}", addr);
 

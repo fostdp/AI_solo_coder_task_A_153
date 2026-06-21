@@ -19,6 +19,8 @@ pub fn check_alerts(
     temperature: f64,
     twist_per_meter: f64,
     critical_rpm: f64,
+    whirl_instability: bool,
+    whirl_ratio: f64,
 ) -> Vec<AlertRecord> {
     let mut alerts = Vec::new();
 
@@ -99,6 +101,18 @@ pub fn check_alerts(
             message: format!("Temperature {:.1}°C exceeds warning threshold 60°C", temperature),
             value: temperature,
             threshold: 60.0,
+        });
+    }
+
+    if whirl_instability {
+        alerts.push(AlertRecord {
+            timestamp: Utc::now().to_rfc3339(),
+            spindle_id: spindle_id.to_string(),
+            alert_type: "oil_whirl".to_string(),
+            severity: "critical".to_string(),
+            message: format!("Oil whirl instability detected, whirl ratio {:.3} exceeds threshold 0.55", whirl_ratio),
+            value: whirl_ratio,
+            threshold: 0.55,
         });
     }
 
